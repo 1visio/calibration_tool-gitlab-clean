@@ -1,0 +1,19 @@
+schema_version: 1
+
+# 用当前历史 golden 产物演示阶段 4。因为阶段 0 快照早于统一 workflow，
+# 此演示不强制 workflow；正式新标定请使用 acceptance_policy.yaml。
+required:
+  workflow_completed: false
+  quality_report: true
+  runtime_profile_clean: true
+  golden_match: true
+  compensation: true
+  artifacts: true
+
+compensation:
+  max_profile_after_pv_mm: 0.25
+  max_profile_after_rms_mm: 0.05
+  min_pv_reduction_fraction: 0.80
+  min_rms_reduction_fraction: 0.80
+  max_repeatability_sigma_mm: 0.02
+

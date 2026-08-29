@@ -1,0 +1,16 @@
+# 标定与在线测量共同使用的实时 Steger extractor。
+# FWHM 约 2～3 px 时建议先从 sigma=1.5 px 开始，现场可改为 1.2～2.0 px 做对照。
+schema_version: 1
+algorithm: steger
+
+steger:
+  sigma: 1.5
+  threshold: 30.0
+  deriv_thresh: 0.5
+  # The band detector already locates the active rows before this margin is
+  # applied. 48 px leaves ample Gaussian/Hessian context for sigma=1.5 while
+  # avoiding a near-full-height Hessian pass. Increase it again for unusually
+  # wide/defocused stripes or abrupt vertical motion.
+  roi_margin: 48
+  roi_max_height: 512
+  scan_axis: column

@@ -1,0 +1,61 @@
+chessboard:
+  corner_window_px: 5
+  corner_max_iterations: 60
+  corner_epsilon: 0.001
+  max_reprojection_rmse_px: 1.0
+  outer_border_squares: 1.0
+  boundary_inset_mm: 2.0
+  boundary_samples_per_line: 160
+
+laser:
+  sensor_max_value: 255
+  background_window_px: 31
+  background_percentile: 0.20
+  profile_smoothing_sigma_px: 0.8
+  min_peak_prominence_ratio: 0.010
+  centroid_half_window_px: 4
+  chess_boundary_exclusion_px: 3.0
+
+line_ransac:
+  iterations: 500
+  threshold_px: 2.1 #默认2.1，B1.7，C1.5
+  min_inliers: 30
+  min_inlier_ratio: 0.25
+  random_seed: 20260724
+
+plane_ransac:
+  iterations: 3000
+  threshold_mm: 0.50 #默认0.5，B0.35，C0.30
+  min_inliers: 300
+  min_inlier_ratio: 0.50
+  random_seed: 20260724
+
+intersection:
+  parallel_epsilon: 1.0e-9
+  min_depth_mm: 50.0
+  max_depth_mm: 5000.0
+
+pair_motion:
+  enabled: true
+  auto_exclude_training: false
+  severe_px: 1.0
+  template_patch_radius_px: 15
+  template_search_radius_px: 14
+  template_min_correlation: 0.45
+  template_consensus_radius_px: 1.5
+  template_min_consensus_ratio: 0.50
+  # 运动检查的参考图是高曝光 chess；nolaser 只用于背景扣除。
+  tracking_min_patch_std_dn: 3.0
+  tracking_min_valid_patch_ratio: 0.50
+  tracking_reject_boundary: true
+
+anomaly:
+  minimum_coverage: 0.08
+  high_outlier_rate: 0.20
+  high_rmse_mm: 0.35
+
+visualisation:
+  max_3d_points_per_pose: 500
+  point_size: 5.0
+  line_width: 0.8
+  dpi: 180

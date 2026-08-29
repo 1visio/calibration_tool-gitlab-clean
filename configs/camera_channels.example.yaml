@@ -1,0 +1,21 @@
+schema_version: 1
+
+# GUI 和 CLI 的统一相机入口。项目只保存 channel 名称；每个通道继续引用
+# 独立相机 YAML，便于现场调整序列号、ROI 和曝光而不复制公共逻辑。
+default_channel: hikrobot
+
+channels:
+  hikrobot:
+    label: 海康 MVS（MV-CS050-60GM）
+    config: camera.mvs.example.yaml
+    workflow_plan: workflow.example.yaml
+
+  daheng:
+    label: 大恒 Galaxy（USB3 Vision）
+    config: camera.daheng.example.yaml
+    workflow_plan: workflow.example.yaml
+
+  synthetic:
+    label: 模拟相机（无硬件演练）
+    config: camera.example.yaml
+    workflow_plan: workflow.example.yaml

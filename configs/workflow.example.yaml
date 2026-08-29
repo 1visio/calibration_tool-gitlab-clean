@@ -1,0 +1,59 @@
+schema_version: 1
+calibration_src: ../calibration/src
+continue_on_error: false
+report: ../reports/example_workflow_run.yaml
+
+# 这是结构示例，不会被自动执行。填入新项目路径后运行：
+# python -m calibration_tool workflow configs/workflow.example.yaml
+stages:
+  - name: intrinsics
+    enabled: false
+    options:
+      fit_dir: ../data/laser_plane/fit
+      test_dir: ../data/laser_plane/validation
+      output: ../runs/0804/intrinsics
+      fit_pattern: "chess *.tif"
+      test_pattern: "chess *.tif"
+      pattern_cols: 11
+      pattern_rows: 8
+      square_size_mm: 20
+  # 默认激光面标定：三模型全部拟合，选用 circular_cone 作为正式输出。
+  - name: laser_surface_models
+    enabled: false
+    options:
+      config: laser_model_fit_config.example.yaml
+      output_dir: ../runs/0804/laser_model
+      model: circular_cone
+  # 旧的全局平面 stage 保留给历史数据复现；不作为新项目默认。
+  - name: laser_plane_shared_steger
+    enabled: false
+    options:
+      intrinsics: ../runs/0804/intrinsics/calibration_result.yaml
+      fit_dir: ../data/laser_plane/fit
+      test_dir: ../data/laser_plane/validation
+      # fit_ids: 1-18
+      test_ids: 1-7
+      pattern_cols: 11
+      pattern_rows: 8
+      square_size_mm: 20
+      config: ../calibration/config/laser_plane_core_config.yaml
+      output_dir: ../runs/0804/laser_plane
+  - name: ground_extrinsics_board_only
+    enabled: false
+    options:
+      intrinsics: ../runs/0804/intrinsics/calibration_result.yaml
+      fit_dir: ../data/extrinsics/fit
+      validation_dir: ../data/extrinsics/validation
+      pattern_cols: 11
+      pattern_rows: 8
+      square_size_mm: 20
+      output_dir: ../runs/0804/ground_extrinsics
+  - name: ground_bias
+    enabled: false
+    options:
+      input_dir: ../runs/0804/ground_reference_pointcloud
+      glob: "*/points_ground.csv"
+      output_dir: ../runs/0804/ground_bias
+      validation_count: 6
+      trend: linear
+      aggregate: median

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packaging
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local configuration and logs
+*.local.yaml
+*.local.yml
+*.log
+
+# Raw data and generated artifacts
+data/**
+projects/**
+runs/**
+experiments/**
+reports/**
+releases/**
+scripts/outputs/**
+
+# Keep optional empty directory markers
+!data/.gitkeep
+!projects/.gitkeep
+!runs/.gitkeep
+!reports/.gitkeep
+!releases/.gitkeep
+

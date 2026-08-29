@@ -1,0 +1,33 @@
+schema_version: 1
+backend: mvs
+serial_number: ""  # 只有一台 MV-CS050-60GM 时可留空；多台时必须填写
+calibration_src: ../calibration/src
+
+# 这里给出常见 Mono8 示例；实际分辨率、ROI 和像素格式应与标定及运行时一致。
+camera:
+  exposure_us: 1200.0
+  gain_db: 0.0
+  pixel_format: Mono8
+  offset_x: 0
+  offset_y: 0
+  width: 2448
+  height: 2048
+  timeout_ms: 2000
+
+quality:
+  max_saturation_fraction: 0.05
+  max_dark_fraction: 0.95
+  min_dynamic_range_u8: 20.0
+  min_laser_coverage: 0.30
+  require_chessboard_detection: true
+  max_chessboard_saturation_fraction: 0.005
+  max_chessboard_highlight_fraction: 0.20
+  max_chessboard_p995_u8: 245.0
+  max_laser_saturation_fraction: 0.001
+  max_laser_peak_saturation_fraction: 0.02
+  max_laser_peak_near_saturation_fraction: 0.10
+  max_laser_saturated_width_px: 1.0
+
+board:
+  pattern_cols: 11
+  pattern_rows: 8

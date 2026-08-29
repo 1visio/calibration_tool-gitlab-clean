@@ -1,0 +1,60 @@
+# 三联图激光表面模型配置。路径相对于本文件。
+intrinsics: ../runs/example/intrinsics/calibration_result.yaml
+output_dir: ../runs/example/laser_model_comparison
+
+laser:
+  orientation: horizontal
+
+default_model: circular_cone
+laser_model:
+  supported: [global_plane, quadratic_graph, circular_cone]
+
+board:
+  pattern_cols: 11
+  pattern_rows: 8
+  square_size_mm: 20.0
+  max_pnp_rmse_px: 0.40
+
+patterns:
+  chess: "chess {id:03d}.tif"
+  background: "nolaser {id:03d}.tif"
+  laser: "laser {id:03d}.tif"
+
+datasets:
+  train:
+    root: ../data/laser_plane/fit
+    ids: [1, 2, 3]
+  validation:
+    root: ../data/laser_plane/validation
+    ids: [1]
+
+extraction:
+  method: steger
+  sigma: 1.5
+  min_intensity: 8.0
+  min_response: 0.8
+  max_subpixel_offset: 0.60
+  board_mask_mode: full_board_physical
+  board_mask_inset_mm: 0.0
+  board_mask_margin_px: -2
+  continuity_poly_degree: 2
+  continuity_threshold_px: 2.0
+  min_points_per_image: 80
+  max_points_per_image: 900
+
+models:
+  quadratic:
+    ridge: 1.0e-10
+  cone:
+    alpha_initial_deg: 89.0
+    alpha_min_deg: 60.0
+    alpha_max_deg: 89.95
+    apex_bounds_mm:
+      - [-1000.0, -1000.0, -500.0]
+      - [1000.0, 1000.0, 500.0]
+    fit_max_points: 3000
+    loss: soft_l1
+    f_scale_mm: 0.10
+    negative_axial_penalty: 2.0
+    max_nfev: 3000
+

@@ -1,0 +1,59 @@
+schema_version: 1
+
+# source profile 的文件缺失、manifest 哈希错误和提取器不一致由审计器自动加入。
+metric_gates:
+  - id: intrinsics.fit_rmse
+    metric: intrinsics_current.fit_rmse_px
+    op: le
+    expected: 0.30
+    failure_status: fail
+    message: 内参拟合集总体重投影 RMSE 应不高于 0.30 px
+  - id: intrinsics.independent_test
+    metric: intrinsics_current.test_image_count
+    op: ge
+    expected: 1
+    failure_status: fail
+    message: 必须保留至少一张完全独立的内参测试图
+  - id: laser_plane.validation_rmse
+    metric: laser_plane_current.validation_rmse_mm
+    op: le
+    expected: 0.25
+    failure_status: fail
+    message: 激光平面独立验证 RMSE 应不高于 0.25 mm
+  - id: laser_plane.validation_p95
+    metric: laser_plane_current.validation_p95_mm
+    op: le
+    expected: 0.50
+    failure_status: fail
+    message: 激光平面独立验证 P95 应不高于 0.50 mm
+  - id: laser_plane.no_pair_motion
+    metric: laser_pair_motion_current.training_moved_count
+    op: eq
+    expected: 0
+    failure_status: fail
+    message: 拟合用棋盘/无激光/有激光三联图不允许检测到明显位移
+  - id: laser_plane.motion_resolved
+    metric: laser_pair_motion_current.training_unresolved_count
+    op: eq
+    expected: 0
+    failure_status: warn
+    message: 拟合用三联图运动检查无法解析时仅作警告；必须人工确认棋盘、相机和支架未移动
+  - id: ground.hybrid_flatness
+    metric: ground_hybrid_current.ground_z_std_passed
+    op: truthy
+    expected: true
+    failure_status: fail
+    message: 混合式地面外参必须通过地面 Z 标准差门禁
+  - id: ground.board_validation_rmse
+    metric: ground_board_only_current.validation_rmse_mm
+    op: le
+    expected: 0.20
+    failure_status: fail
+    message: 棋盘基准面外参独立验证 RMSE 应不高于 0.20 mm
+  - id: compensation.independent_validation
+    metric: compensation_current.independent_validation_frame_count
+    op: ge
+    expected: 1
+    failure_status: fail
+    message: 地面补偿必须使用未参与建表的独立帧验证
+

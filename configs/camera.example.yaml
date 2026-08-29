@@ -1,0 +1,40 @@
+schema_version: 1
+
+# 默认使用模拟相机，便于在没有 MVS SDK/硬件时验证采集链路。
+# 连接真实相机时改为 mvs，并填写 serial_number；也可直接使用 camera.mvs.example.yaml。
+backend: synthetic
+serial_number: SIM-001
+calibration_src: ../calibration/src
+
+# 分辨率仅用于模拟演练；实际项目应与相机和标定图像保持一致。
+camera:
+  exposure_us: 1200.0
+  gain_db: 0.0
+  pixel_format: Mono8
+  offset_x: 0
+  offset_y: 0
+  width: 2448
+  height: 2048
+  timeout_ms: 2000
+
+quality:
+  max_saturation_fraction: 0.05
+  max_dark_fraction: 0.95
+  min_dynamic_range_u8: 20.0
+  min_laser_coverage: 0.30
+  require_chessboard_detection: true
+  max_chessboard_saturation_fraction: 0.005
+  max_chessboard_highlight_fraction: 0.20
+  max_chessboard_p995_u8: 245.0
+  max_laser_saturation_fraction: 0.001
+  max_laser_peak_saturation_fraction: 0.02
+  max_laser_peak_near_saturation_fraction: 0.10
+  max_laser_saturated_width_px: 1.0
+
+board:
+  pattern_cols: 11
+  pattern_rows: 8
+
+backend_options:
+  target_fps: 30.0
+  seed: 20260803

@@ -1,0 +1,40 @@
+schema_version: 1
+backend: daheng
+serial_number: ""  # 只有一台大恒 USB3 相机时可留空；多台时必须填写
+calibration_src: ../calibration/src
+
+laser:
+  orientation: vertical
+
+# Galaxy SDK 默认从 C:\Program Files\Daheng Imaging\GalaxySDK 加载。
+# 非默认安装位置可设置环境变量 DAHENG_GALAXY_ROOT。
+camera:
+  exposure_us: 120000
+  gain_db: 0.0
+  pixel_format: Mono8
+  offset_x: 0
+  offset_y: 0
+  width: 4096
+  height: 3000
+  timeout_ms: 2000
+
+quality:
+  max_saturation_fraction: 0.05
+  max_dark_fraction: 0.95
+  min_dynamic_range_u8: 20.0
+  min_laser_coverage: 0.30
+  require_chessboard_detection: true
+  max_chessboard_saturation_fraction: 0.005
+  max_chessboard_highlight_fraction: 0.20
+  max_chessboard_p995_u8: 245.0
+  max_laser_saturation_fraction: 0.001
+  max_laser_peak_saturation_fraction: 0.02
+  max_laser_peak_near_saturation_fraction: 0.10
+  max_laser_saturated_width_px: 1.0
+
+board:
+  pattern_cols: 11
+  pattern_rows: 8
+
+backend_options:
+  discovery_timeout_ms: 1000

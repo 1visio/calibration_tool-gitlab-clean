@@ -1,0 +1,12 @@
+schema_version: 1
+
+# Golden baseline 必须从本项目已经确认的运行配置和标定产物生成。
+# 路径相对于本文件；下面仅为结构示例，使用前请替换。
+sources:
+  measurement_tool:
+    role: online
+    config: ../projects/example/runtime_config.yaml
+    expected_extractor: steger
+
+regressions: {}
+

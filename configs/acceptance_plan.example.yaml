@@ -1,0 +1,22 @@
+schema_version: 1
+report_id: example-calibration-acceptance
+title: 线激光标定验收报告
+output_dir: ../reports/example_acceptance
+policy: acceptance_policy.golden_audit.yaml
+
+inputs:
+  # 下面均为项目内占位路径；生成报告前请替换为本项目真实产物。
+  workflow_report: null
+  quality_reports: []
+  runtime_config: ../projects/example/runtime_config.yaml
+  expected_extractor: steger
+  golden_baseline: ../runs/golden/baseline.yaml
+  compensation_metrics: ../runs/example/ground_bias/compensation_metrics.json
+  artifacts: []
+
+# 只有验收 decision=accepted 时才会执行发布。示例默认关闭，避免误发历史产物。
+release:
+  enabled: false
+  package_id: example-accepted-v1
+  runtime_config: ../projects/example/runtime_config.yaml
+  output_dir: ../releases/example-accepted-v1

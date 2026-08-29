@@ -1,0 +1,41 @@
+schema_version: 1
+project_id: example-line-laser-calibration
+# 激光面模型默认使用圆锥；支持 global_plane、quadratic_graph、circular_cone。
+# 旧的 plane_abcd/laser_plane 文件仍会按 global_plane 读取。
+laser_model: circular_cone
+laser:
+  orientation: horizontal
+camera:
+  model: ""
+  serial_number: ""
+  image_width: 2448
+  image_height: 2048
+  pixel_format: Mono8
+board:
+  pattern_cols: 11
+  pattern_rows: 8
+  square_size_mm: 20.0
+exposures_us:
+  chessboard: 20000
+  laser_board: 400
+  ground_runtime: 1200
+algorithm_profile:
+  extractor: steger
+  settings:
+    # 运行时从 calibration/config/realtime_steger.yaml 继承；
+    # 修改该 profile 即可同步标定和在线测量。
+    sigma: 1.5
+    threshold: 30.0
+    deriv_thresh: 0.5
+    roi_margin: 120
+    roi_max_height: 512
+    scan_axis: column
+datasets:
+  intrinsics_fit: null
+  intrinsics_validation: null
+  laser_plane_fit: null
+  laser_plane_validation: null
+  ground_fit: null
+  ground_validation: null
+  compensation_build: null
+  compensation_validation: null
