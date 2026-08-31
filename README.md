@@ -48,6 +48,19 @@ python -m calibration_tool gui --project configs\wizard_project.local.yaml
 
 完整操作说明见 [线激光标定工具用户手册](docs/线激光标定工具用户手册.md)。
 
+## 五步向导与标定结果
+
+向导依次完成项目、相机与曝光、批量采集、一键标定和标定结果查看。完整
+workflow 成功后，工具会在共同 run 目录写入 `calibration_run.yaml`，并在已保存的
+项目中记录 `last_calibration_run`。第 5 页以 `CalibrationRun` 为统一入口，提供
+“结果总览”“相机内参”“激光表面”“地面外参”四个页签；页面只读取现有结果文件，
+不会重新拟合或猜测缺失参数。缺失阶段、缺失文件和损坏结果分别显示“未执行”、
+“暂无”或明确的读取错误。
+
+“打开历史标定结果…”既支持新的 `calibration_run.yaml`，也兼容旧
+`workflow_*.yaml`。正式验收与发布门禁仍由 `acceptance-report` 和
+`bundle-build` 命令负责，不与结果展示状态混为一体。
+
 ## 主要命令
 
 ```text
@@ -103,4 +116,3 @@ python -m pytest -q
 ```
 
 测试会使用临时目录或模拟数据，不需要提交本地标定数据。
-

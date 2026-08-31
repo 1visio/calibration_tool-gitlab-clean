@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import threading
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -9,8 +10,9 @@ from typing import Any, Callable, Mapping
 
 import cv2
 from PySide6.QtCore import QSignalBlocker, QThreadPool, Qt, Signal, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -21,15 +23,18 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -47,12 +52,26 @@ from ..camera.plan_builder import (
     save_generated_capture_plan,
 )
 from ..acceptance import build_acceptance_report
+from ..calibration_run import CalibrationRun
+from ..calibration_run_io import DEFAULT_CALIBRATION_RUN_FILENAME, load_calibration_run
+from ..calibration_results import (
+    CalibrationResultsSummary,
+    GroundExtrinsicsDetails,
+    IntrinsicsDetails,
+    LaserSurfaceDetails,
+    NOT_EXECUTED,
+    load_ground_extrinsics_details,
+    load_intrinsics_details,
+    load_laser_surface_details,
+    summarize_calibration_run,
+)
 from ..camera.models import CameraConfig, CapturePlan, CaptureTask
 from ..camera.quality import analyze_frame, quality_to_dict
 from ..camera.steger_quality import RealtimeStegerQualityAnalyzer
 from ..io_utils import load_document, resolve_relative
 from ..io_utils import sha256_file
 from ..laser import LaserConfig
+from ..laser_models import SUPPORTED_LASER_MODEL_TYPES
 from ..workflow import run_workflow
 from .project import WizardProject
 from .result_artifacts import (
@@ -86,6 +105,59 @@ def _preview_settling_info(quality: Mapping[str, Any]) -> tuple[bool, int]:
     except (TypeError, ValueError):
         remaining = 0
     return settling, remaining
+
+
+class LaserPlotPreview(QLabel):
+    """随内容宽度变化、保持原始比例的验证误差图预览。"""
+
+    MINIMUM_PLOT_HEIGHT = 280
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(self.MINIMUM_PLOT_HEIGHT)
+
+    def set_plot_pixmap(self, pixmap: QPixmap) -> None:
+        self._source_pixmap = pixmap
+        self._refresh_plot()
+
+    def clear_plot(self) -> None:
+        self._source_pixmap = QPixmap()
+        self.clear()
+        self.setFixedHeight(self.MINIMUM_PLOT_HEIGHT)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_plot()
+
+    def _refresh_plot(self) -> None:
+        if self._source_pixmap.isNull():
+            return
+        target_width = self.width()
+        if target_width <= 0:
+            target_width = self._source_pixmap.width()
+        scaled = self._source_pixmap.scaled(
+            target_width,
+            self._source_pixmap.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+        self.setFixedHeight(max(self.MINIMUM_PLOT_HEIGHT, scaled.height()))
+
+
+_RESULT_PAGE_MARGINS = (12, 12, 12, 12)
+_RESULT_PAGE_SPACING = 10
+
+
+def _configure_result_page_layout(layout: QLayout) -> None:
+    """保持四个结果页签的外层间距一致。"""
+
+    layout.setContentsMargins(*_RESULT_PAGE_MARGINS)
+    layout.setSpacing(_RESULT_PAGE_SPACING)
 
 
 class ProjectPage(QWidget):
@@ -183,6 +255,7 @@ class ProjectPage(QWidget):
             square_size_mm=self.square_size.value(),
             source_path=self.project.source_path if self.project else None,
             extra=self.project.extra if self.project else {},
+            last_calibration_run=self.project.last_calibration_run if self.project else None,
         )
 
     def _selected_camera_channel(self) -> str | None:
@@ -1999,6 +2072,9 @@ class ResultsPage(QWidget):
         super().__init__(parent)
         self.thread_pool = thread_pool
         self._workers: set[FunctionWorker] = set()
+        self.current_run: CalibrationRun | None = None
+        self.current_run_path: Path | None = None
+        # current_result 保留为展示投影，正式标定结果以 current_run 为准。
         self.current_result: dict[str, Any] | None = None
         self.project: WizardProject | None = None
         self.last_html: Path | None = None
@@ -2006,70 +2082,494 @@ class ResultsPage(QWidget):
         self._artifact_records: list[ResultArtifact] = []
         self._filtered_artifacts: list[ResultArtifact] = []
         self._current_artifact_index = -1
+        self._results_summary: CalibrationResultsSummary | None = None
+        self._laser_surface_details: LaserSurfaceDetails | None = None
+        self._ground_extrinsics_details: GroundExtrinsicsDetails | None = None
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
         title_row = QHBoxLayout()
-        title = QLabel("5. 报告、补偿对比与验收闭环"); title.setObjectName("pageTitle")
-        self.load_button = QPushButton("打开报告…")
-        title_row.addWidget(title); title_row.addStretch(); title_row.addWidget(self.load_button); layout.addLayout(title_row)
-        acceptance_box = QGroupBox("生成正式验收报告")
-        acceptance_layout = QGridLayout(acceptance_box)
-        self.acceptance_plan = QLineEdit()
-        self.acceptance_overwrite = QCheckBox("覆盖已有报告")
-        self.acceptance_button = QPushButton("生成并判定")
-        self.open_html_button = QPushButton("打开 HTML 报告")
-        self.open_html_button.setEnabled(False)
-        self.acceptance_status = QLabel("尚未执行验收")
-        acceptance_layout.addWidget(QLabel("验收计划"), 0, 0)
-        acceptance_layout.addWidget(_path_row(self.acceptance_plan, self, file_filter="YAML (*.yaml *.yml)"), 0, 1, 1, 3)
-        acceptance_layout.addWidget(self.acceptance_overwrite, 1, 1)
-        acceptance_layout.addWidget(self.acceptance_button, 1, 2)
-        acceptance_layout.addWidget(self.open_html_button, 1, 3)
-        acceptance_layout.addWidget(self.acceptance_status, 2, 0, 1, 4)
-        layout.addWidget(acceptance_box)
-        browser_box = QGroupBox("逐图结果浏览")
-        browser_layout = QVBoxLayout(browser_box)
-        filter_row = QHBoxLayout()
-        self.stage_filter = QComboBox(); self.split_filter = QComboBox(); self.pose_filter = QComboBox(); self.status_filter = QComboBox()
-        for combo, label in (
-            (self.stage_filter, "stage"),
-            (self.split_filter, "split"),
-            (self.pose_filter, "pose_id"),
-            (self.status_filter, "状态"),
+        title_row.setSpacing(12)
+        title = QLabel("5. 标定结果与误差分析"); title.setObjectName("pageTitle")
+        self.run_status = QLabel("当前项目暂无标定结果")
+        self.run_status.setWordWrap(True)
+        self.load_button = QPushButton("打开历史标定结果…")
+        title_row.addWidget(title); title_row.addWidget(self.run_status, 1); title_row.addWidget(self.load_button); layout.addLayout(title_row)
+
+        self.result_tabs = QTabWidget()
+        overview_page = QWidget()
+        overview_page_layout = QVBoxLayout(overview_page)
+        _configure_result_page_layout(overview_page_layout)
+        self.overview_box = QGroupBox("结果总览")
+        overview_layout = QGridLayout(self.overview_box)
+        self.overview_run_id = QLabel("暂无")
+        self.overview_time = QLabel("暂无")
+        self.overview_status = QLabel("暂无")
+        self.overview_overall = QLabel("暂无")
+        self.overview_orientation = QLabel("暂无")
+        for row, (label, widget) in enumerate(
+            (
+                ("run_id", self.overview_run_id),
+                ("标定时间", self.overview_time),
+                ("执行状态", self.overview_status),
+                ("整体状态", self.overview_overall),
+                ("激光方向", self.overview_orientation),
+            )
         ):
-            filter_row.addWidget(QLabel(label)); filter_row.addWidget(combo)
-        self.previous_artifact_button = QPushButton("上一张")
-        self.next_artifact_button = QPushButton("下一张")
-        self.open_artifact_button = QPushButton("在文件夹中打开")
-        filter_row.addWidget(self.previous_artifact_button); filter_row.addWidget(self.next_artifact_button); filter_row.addWidget(self.open_artifact_button)
-        browser_layout.addLayout(filter_row)
+            overview_layout.addWidget(QLabel(label), row // 2, (row % 2) * 2)
+            overview_layout.addWidget(widget, row // 2, (row % 2) * 2 + 1)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget(); left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("报告指标与质量门禁"))
-        self.tree = QTreeWidget(); self.tree.setHeaderLabels(["项目", "值"]); self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.setMaximumHeight(180)
-        left_layout.addWidget(self.tree)
-        left_layout.addWidget(QLabel("stage / split / pose_id"))
-        self.artifact_tree = QTreeWidget(); self.artifact_tree.setHeaderLabels(["结果产物", "状态"])
-        self.artifact_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        left_layout.addWidget(self.artifact_tree, 1)
-        # 保留旧 QListWidget 属性，兼容旧插件/测试；新界面使用 artifact_tree。
-        self.artifacts = QListWidget(); self.artifacts.setVisible(False)
+        self.intrinsics_summary_box = QGroupBox("相机内参")
+        intrinsics_layout = QGridLayout(self.intrinsics_summary_box)
+        self.intrinsics_status = QLabel("未执行")
+        self.intrinsics_fit_rmse = QLabel("未执行")
+        self.intrinsics_test_rmse = QLabel("未执行")
+        self.intrinsics_fit_images = QLabel("未执行")
+        self.intrinsics_test_images = QLabel("未执行")
+        intrinsics_fields = (
+            ("状态", self.intrinsics_status),
+            ("Fit RMSE", self.intrinsics_fit_rmse),
+            ("Test RMSE", self.intrinsics_test_rmse),
+            ("Fit 图像数", self.intrinsics_fit_images),
+            ("Test 图像数", self.intrinsics_test_images),
+        )
+        for row, (label, widget) in enumerate(intrinsics_fields):
+            intrinsics_layout.addWidget(QLabel(label), row, 0)
+            intrinsics_layout.addWidget(widget, row, 1)
 
-        center = QWidget(); center_layout = QVBoxLayout(center)
-        self.image_preview = ImagePreview(); center_layout.addWidget(self.image_preview, 1)
-        self.image_status = QLabel("请选择结果图")
-        self.image_status.setWordWrap(True); center_layout.addWidget(self.image_status)
+        self.laser_summary_box = QGroupBox("激光表面")
+        laser_layout = QGridLayout(self.laser_summary_box)
+        self.laser_status = QLabel("未执行")
+        self.laser_model = QLabel("未执行")
+        self.laser_validation_rmse = QLabel("未执行")
+        self.laser_validation_p95 = QLabel("未执行")
+        self.laser_valid_rate = QLabel("未执行")
+        laser_fields = (
+            ("状态", self.laser_status),
+            ("模型", self.laser_model),
+            ("Validation RMSE", self.laser_validation_rmse),
+            ("Validation P95", self.laser_validation_p95),
+            ("Valid Rate", self.laser_valid_rate),
+        )
+        for row, (label, widget) in enumerate(laser_fields):
+            laser_layout.addWidget(QLabel(label), row, 0)
+            laser_layout.addWidget(widget, row, 1)
 
-        right = QWidget(); right_layout = QVBoxLayout(right)
-        self.artifact_info = QLabel("暂无文件信息")
-        self.artifact_info.setWordWrap(True); right_layout.addWidget(self.artifact_info)
-        self.plot = ResidualPlot(); right_layout.addWidget(self.plot)
-        self.table = QTableWidget(); right_layout.addWidget(self.table, 1)
-        splitter.addWidget(left); splitter.addWidget(center); splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 3); splitter.setStretchFactor(2, 2)
-        browser_layout.addWidget(splitter, 1)
-        layout.addWidget(browser_box, 1)
+        self.ground_summary_box = QGroupBox("地面外参")
+        ground_layout = QGridLayout(self.ground_summary_box)
+        self.ground_status = QLabel("未执行")
+        self.ground_validation_rmse = QLabel("未执行")
+        self.ground_validation_p95 = QLabel("未执行")
+        ground_fields = (
+            ("状态", self.ground_status),
+            ("Validation RMSE", self.ground_validation_rmse),
+            ("Validation P95", self.ground_validation_p95),
+        )
+        for row, (label, widget) in enumerate(ground_fields):
+            ground_layout.addWidget(QLabel(label), row, 0)
+            ground_layout.addWidget(widget, row, 1)
+
+        cards = QHBoxLayout()
+        cards.addWidget(self.intrinsics_summary_box, 1)
+        cards.addWidget(self.laser_summary_box, 1)
+        cards.addWidget(self.ground_summary_box, 1)
+        overview_layout.addLayout(cards, 3, 0, 1, 4)
+        overview_page_layout.addWidget(self.overview_box)
+        overview_page_layout.addStretch()
+        self.result_tabs.addTab(overview_page, "结果总览")
+
+        intrinsics_page = QWidget()
+        intrinsics_page_layout = QVBoxLayout(intrinsics_page)
+        _configure_result_page_layout(intrinsics_page_layout)
+        self.intrinsics_detail_status = QLabel("未执行")
+        self.intrinsics_detail_status.setWordWrap(True)
+        intrinsics_page_layout.addWidget(self.intrinsics_detail_status)
+
+        camera_parameters_box = QGroupBox("相机内参")
+        camera_parameters_layout = QGridLayout(camera_parameters_box)
+        self.intrinsics_fx = QLabel("未执行")
+        self.intrinsics_fy = QLabel("未执行")
+        self.intrinsics_cx = QLabel("未执行")
+        self.intrinsics_cy = QLabel("未执行")
+        for column, (label, widget) in enumerate(
+            (
+                ("fx", self.intrinsics_fx),
+                ("fy", self.intrinsics_fy),
+                ("cx", self.intrinsics_cx),
+                ("cy", self.intrinsics_cy),
+            )
+        ):
+            camera_parameters_layout.addWidget(QLabel(label), 0, column * 2)
+            camera_parameters_layout.addWidget(widget, 0, column * 2 + 1)
+        self.intrinsics_k1 = QLabel("未执行")
+        self.intrinsics_k2 = QLabel("未执行")
+        self.intrinsics_p1 = QLabel("未执行")
+        self.intrinsics_p2 = QLabel("未执行")
+        self.intrinsics_k3 = QLabel("未执行")
+        for column, (label, widget) in enumerate(
+            (
+                ("k1", self.intrinsics_k1),
+                ("k2", self.intrinsics_k2),
+                ("p1", self.intrinsics_p1),
+                ("p2", self.intrinsics_p2),
+                ("k3", self.intrinsics_k3),
+            )
+        ):
+            camera_parameters_layout.addWidget(QLabel(label), 1, column * 2)
+            camera_parameters_layout.addWidget(widget, 1, column * 2 + 1)
+        intrinsics_page_layout.addWidget(camera_parameters_box)
+
+        intrinsics_metrics_box = QGroupBox("重投影误差")
+        intrinsics_metrics_layout = QGridLayout(intrinsics_metrics_box)
+        self.intrinsics_detail_fit_rmse = QLabel("未执行")
+        self.intrinsics_detail_test_rmse = QLabel("未执行")
+        self.intrinsics_detail_fit_images = QLabel("未执行")
+        self.intrinsics_detail_test_images = QLabel("未执行")
+        for row, (label, widget) in enumerate(
+            (
+                ("Fit RMSE", self.intrinsics_detail_fit_rmse),
+                ("Test RMSE", self.intrinsics_detail_test_rmse),
+                ("Fit 图像数", self.intrinsics_detail_fit_images),
+                ("Test 图像数", self.intrinsics_detail_test_images),
+            )
+        ):
+            intrinsics_metrics_layout.addWidget(QLabel(label), row // 2, (row % 2) * 2)
+            intrinsics_metrics_layout.addWidget(widget, row // 2, (row % 2) * 2 + 1)
+        intrinsics_page_layout.addWidget(intrinsics_metrics_box)
+
+        reprojection_box = QGroupBox("逐图重投影误差（已有结果）")
+        reprojection_layout = QVBoxLayout(reprojection_box)
+        self.intrinsics_reprojection_status = QLabel("未执行")
+        self.intrinsics_reprojection_status.setWordWrap(True)
+        reprojection_layout.addWidget(self.intrinsics_reprojection_status)
+        self.intrinsics_reprojection_table = QTableWidget()
+        self.intrinsics_reprojection_table.setColumnCount(5)
+        self.intrinsics_reprojection_table.setHorizontalHeaderLabels(
+            ["数据集", "图像", "状态", "RMSE (px)", "平均误差 (px)"]
+        )
+        self.intrinsics_reprojection_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.intrinsics_reprojection_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.intrinsics_reprojection_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.intrinsics_reprojection_table.horizontalHeader().setStretchLastSection(True)
+        self.intrinsics_reprojection_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        reprojection_layout.addWidget(self.intrinsics_reprojection_table)
+        intrinsics_page_layout.addWidget(reprojection_box)
+        intrinsics_page_layout.addStretch()
+        self.result_tabs.addTab(intrinsics_page, "相机内参")
+
+        self.laser_page = QWidget()
+        laser_page_layout = QVBoxLayout(self.laser_page)
+        _configure_result_page_layout(laser_page_layout)
+        self.laser_scroll_area = QScrollArea(self.laser_page)
+        self.laser_scroll_area.setWidgetResizable(True)
+        self.laser_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.laser_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.laser_content = QWidget()
+        self.laser_content.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
+        self.laser_content_layout = QVBoxLayout(self.laser_content)
+        _configure_result_page_layout(self.laser_content_layout)
+        self.laser_content_layout.setSizeConstraint(
+            QLayout.SizeConstraint.SetMinimumSize
+        )
+        laser_details_box = QGroupBox("当前采用模型")
+        laser_details_layout = QGridLayout(laser_details_box)
+        self.laser_detail_status = QLabel("未执行")
+        self.laser_detail_model = QLabel("未执行")
+        self.laser_detail_validation_rmse = QLabel("未执行")
+        self.laser_detail_validation_p95 = QLabel("未执行")
+        self.laser_detail_valid_rate = QLabel("未执行")
+        for row, (label, widget) in enumerate(
+            (
+                ("阶段状态", self.laser_detail_status),
+                ("当前采用模型", self.laser_detail_model),
+                ("Validation RMSE", self.laser_detail_validation_rmse),
+                ("Validation P95", self.laser_detail_validation_p95),
+                ("Valid Rate", self.laser_detail_valid_rate),
+            )
+        ):
+            laser_details_layout.addWidget(QLabel(label), row, 0)
+            laser_details_layout.addWidget(widget, row, 1)
+        self.laser_content_layout.addWidget(laser_details_box)
+
+        laser_comparison_box = QGroupBox("三模型比较（训练集 / 独立验证集）")
+        laser_comparison_layout = QVBoxLayout(laser_comparison_box)
+        self.laser_model_comparison_status = QLabel("未执行")
+        self.laser_model_comparison_status.setWordWrap(True)
+        laser_comparison_layout.addWidget(self.laser_model_comparison_status)
+        self.laser_model_comparison_table = QTableWidget()
+        # 别名便于后续详细页复用，也不与旧的兼容 table 混淆。
+        self.laser_comparison_table = self.laser_model_comparison_table
+        self.laser_model_comparison_table.setColumnCount(7)
+        self.laser_model_comparison_table.setHorizontalHeaderLabels(
+            [
+                "模型",
+                "Train RMSE (mm)",
+                "Validation RMSE (mm)",
+                "Validation P95 (mm)",
+                "Validation Max (mm)",
+                "Valid Rate",
+                "状态",
+            ]
+        )
+        self.laser_model_comparison_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.laser_model_comparison_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.laser_model_comparison_table.horizontalHeader().setStretchLastSection(True)
+        laser_comparison_layout.addWidget(self.laser_model_comparison_table)
+        self.laser_content_layout.addWidget(laser_comparison_box)
+
+        self.laser_error_plots_box = QGroupBox("已有验证误差趋势")
+        laser_error_plots_layout = QVBoxLayout(self.laser_error_plots_box)
+        self.laser_error_plots_status = QLabel(
+            "仅展示已有 validation error 图，不重新计算。"
+        )
+        self.laser_error_plots_status.setWordWrap(True)
+        laser_error_plots_layout.addWidget(self.laser_error_plots_status)
+        laser_plot_layout = QVBoxLayout()
+        self.laser_error_vs_u = LaserPlotPreview()
+        self.laser_error_vs_v = LaserPlotPreview()
+        self.laser_error_vs_depth = LaserPlotPreview()
+        self.laser_error_vs_u_card = self._build_laser_plot_card(
+            "error vs U", self.laser_error_vs_u
+        )
+        self.laser_error_vs_v_card = self._build_laser_plot_card(
+            "error vs V", self.laser_error_vs_v
+        )
+        self.laser_error_vs_depth_card = self._build_laser_plot_card(
+            "error vs Depth", self.laser_error_vs_depth
+        )
+        for card in (
+            (
+                self.laser_error_vs_u_card,
+                self.laser_error_vs_v_card,
+                self.laser_error_vs_depth_card,
+            )
+        ):
+            laser_plot_layout.addWidget(card)
+        laser_error_plots_layout.addLayout(laser_plot_layout)
+        self.laser_content_layout.addWidget(self.laser_error_plots_box)
+
+        self.laser_parameters_toggle = QPushButton("模型参数（展开）")
+        self.laser_parameters_toggle.setCheckable(True)
+        self.laser_parameters_toggle.toggled.connect(self._toggle_laser_parameters)
+        self.laser_content_layout.addWidget(self.laser_parameters_toggle)
+        self.laser_parameters_panel = QWidget()
+        laser_parameters_layout = QVBoxLayout(self.laser_parameters_panel)
+        laser_parameters_layout.setContentsMargins(0, 0, 0, 0)
+        self.laser_model_parameters_table = QTableWidget()
+        self.laser_model_parameters_table.setColumnCount(3)
+        self.laser_model_parameters_table.setHorizontalHeaderLabels(
+            ["模型", "参数", "值"]
+        )
+        self.laser_model_parameters_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.laser_model_parameters_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.laser_model_parameters_table.horizontalHeader().setStretchLastSection(True)
+        laser_parameters_layout.addWidget(self.laser_model_parameters_table)
+        self.laser_parameters_panel.setVisible(False)
+        self.laser_content_layout.addWidget(self.laser_parameters_panel)
+        self.laser_content_layout.addStretch()
+        self.laser_scroll_area.setWidget(self.laser_content)
+        laser_page_layout.addWidget(self.laser_scroll_area)
+        self.result_tabs.addTab(self.laser_page, "激光表面")
+
+        self.ground_page = QWidget()
+        ground_page_layout = QVBoxLayout(self.ground_page)
+        _configure_result_page_layout(ground_page_layout)
+        self.ground_scroll_area = QScrollArea(self.ground_page)
+        self.ground_scroll_area.setWidgetResizable(True)
+        self.ground_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.ground_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.ground_content = QWidget()
+        self.ground_content.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
+        self.ground_content_layout = QVBoxLayout(self.ground_content)
+        _configure_result_page_layout(self.ground_content_layout)
+        self.ground_content_layout.setSizeConstraint(
+            QLayout.SizeConstraint.SetMinimumSize
+        )
+
+        ground_details_box = QGroupBox("最终结果")
+        ground_details_layout = QGridLayout(ground_details_box)
+        self.ground_detail_status = QLabel("未执行")
+        self.ground_detail_stage = QLabel("未执行")
+        self.ground_detail_validation_rmse = QLabel("未执行")
+        self.ground_detail_validation_p95 = QLabel("未执行")
+        self.ground_detail_fit_frames = QLabel("未执行")
+        self.ground_detail_validation_frames = QLabel("未执行")
+        for row, (label, widget) in enumerate(
+            (
+                ("阶段状态", self.ground_detail_status),
+                ("阶段", self.ground_detail_stage),
+                ("Validation RMSE", self.ground_detail_validation_rmse),
+                ("Validation P95", self.ground_detail_validation_p95),
+                ("Fit frame 数", self.ground_detail_fit_frames),
+                ("Validation frame 数", self.ground_detail_validation_frames),
+            )
+        ):
+            ground_details_layout.addWidget(QLabel(label), row, 0)
+            ground_details_layout.addWidget(widget, row, 1)
+        self.ground_content_layout.addWidget(ground_details_box)
+
+        ground_pose_box = QGroupBox("最终外参（camera → ground）")
+        ground_pose_layout = QGridLayout(ground_pose_box)
+        self.ground_pose_status = QLabel("未执行")
+        self.ground_pose_status.setWordWrap(True)
+        self.ground_transform_name = QLabel("未执行")
+        ground_pose_layout.addWidget(QLabel("读取状态"), 0, 0)
+        ground_pose_layout.addWidget(self.ground_pose_status, 0, 1, 1, 3)
+        ground_pose_layout.addWidget(QLabel("变换"), 1, 0)
+        ground_pose_layout.addWidget(self.ground_transform_name, 1, 1, 1, 3)
+
+        ground_pose_layout.addWidget(QLabel("Rotation Matrix R"), 2, 0)
+        self.ground_rotation_table = QTableWidget()
+        self.ground_rotation_matrix_table = self.ground_rotation_table
+        self.ground_rotation_table.setRowCount(3)
+        self.ground_rotation_table.setColumnCount(3)
+        self.ground_rotation_table.setHorizontalHeaderLabels(["Xc", "Yc", "Zc"])
+        self.ground_rotation_table.setVerticalHeaderLabels(["Xg", "Yg", "Zg"])
+        self.ground_rotation_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.ground_rotation_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.ground_rotation_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.ground_rotation_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.ground_rotation_table.horizontalHeader().setStretchLastSection(True)
+        ground_pose_layout.addWidget(self.ground_rotation_table, 2, 1, 3, 3)
+
+        ground_pose_layout.addWidget(QLabel("Translation t (mm)"), 5, 0)
+        self.ground_translation = QLabel("未执行")
+        self.ground_translation_values = self.ground_translation
+        self.ground_translation.setWordWrap(True)
+        ground_pose_layout.addWidget(self.ground_translation, 5, 1, 1, 3)
+
+        ground_pose_layout.addWidget(QLabel("Roll / Pitch / Yaw"), 6, 0)
+        self.ground_euler_status = QLabel("未执行")
+        self.ground_euler_status.setWordWrap(True)
+        ground_pose_layout.addWidget(self.ground_euler_status, 6, 1, 1, 3)
+        self.ground_roll = QLabel("未执行")
+        self.ground_pitch = QLabel("未执行")
+        self.ground_yaw = QLabel("未执行")
+        for column, (label, widget) in enumerate(
+            (
+                ("Roll", self.ground_roll),
+                ("Pitch", self.ground_pitch),
+                ("Yaw", self.ground_yaw),
+            )
+        ):
+            ground_pose_layout.addWidget(QLabel(label), 7, column * 2)
+            ground_pose_layout.addWidget(widget, 7, column * 2 + 1)
+        self.ground_content_layout.addWidget(ground_pose_box)
+
+        ground_validation_box = QGroupBox("独立验证误差（已有结果）")
+        ground_validation_layout = QVBoxLayout(ground_validation_box)
+        self.ground_validation_status = QLabel("未执行")
+        self.ground_validation_status.setWordWrap(True)
+        ground_validation_layout.addWidget(self.ground_validation_status)
+        self.ground_validation_table = QTableWidget()
+        self.ground_validation_errors_table = self.ground_validation_table
+        self.ground_validation_table.setColumnCount(8)
+        self.ground_validation_table.setHorizontalHeaderLabels(
+            [
+                "Frame",
+                "状态",
+                "PnP RMSE (px)",
+                "RMSE (mm)",
+                "P95 (mm)",
+                "Max (mm)",
+                "Std (mm)",
+                "Points",
+            ]
+        )
+        self.ground_validation_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.ground_validation_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.ground_validation_table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.ground_validation_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.ground_validation_table.horizontalHeader().setStretchLastSection(True)
+        ground_validation_layout.addWidget(self.ground_validation_table)
+        self.ground_validation_error_plot = LaserPlotPreview()
+        self.ground_validation_plot = self.ground_validation_error_plot
+        self.ground_validation_error_plot_card = self._build_laser_plot_card(
+            "Validation Zg residual", self.ground_validation_error_plot
+        )
+        self.ground_validation_plot_card = self.ground_validation_error_plot_card
+        self.ground_validation_error_plot_card.setVisible(False)
+        ground_validation_layout.addWidget(self.ground_validation_error_plot_card)
+        self.ground_content_layout.addWidget(ground_validation_box)
+        self.ground_content_layout.addStretch()
+        self.ground_scroll_area.setWidget(self.ground_content)
+        ground_page_layout.addWidget(self.ground_scroll_area)
+        self.result_tabs.addTab(self.ground_page, "地面外参")
+        layout.addWidget(self.result_tabs, 1)
+
+        # acceptance/result_artifacts 仍由底层模块和旧脚本使用；这里只保留不挂到
+        # 页面布局的兼容对象，不向用户暴露验收、逐图、CSV 或原始图像控件。
+        self._legacy_compat_host = QWidget(self)
+        self._legacy_compat_host.hide()
+        self.acceptance_plan = QLineEdit(self._legacy_compat_host)
+        self.acceptance_overwrite = QCheckBox("覆盖已有报告", self._legacy_compat_host)
+        self.acceptance_button = QPushButton("生成并判定", self._legacy_compat_host)
+        self.open_html_button = QPushButton("打开 HTML 报告", self._legacy_compat_host)
+        self.open_html_button.setEnabled(False)
+        self.acceptance_status = QLabel("尚未执行验收", self._legacy_compat_host)
+        self.stage_filter = QComboBox(self._legacy_compat_host)
+        self.split_filter = QComboBox(self._legacy_compat_host)
+        self.pose_filter = QComboBox(self._legacy_compat_host)
+        self.status_filter = QComboBox(self._legacy_compat_host)
+        self.previous_artifact_button = QPushButton("上一张", self._legacy_compat_host)
+        self.next_artifact_button = QPushButton("下一张", self._legacy_compat_host)
+        self.open_artifact_button = QPushButton("在文件夹中打开", self._legacy_compat_host)
+        self.tree = QTreeWidget(self._legacy_compat_host)
+        self.tree.setHeaderLabels(["项目", "值"])
+        self.artifact_tree = QTreeWidget(self._legacy_compat_host)
+        self.artifact_tree.setHeaderLabels(["结果产物", "状态"])
+        self.artifacts = QListWidget(self._legacy_compat_host)
+        self.image_preview = ImagePreview(self._legacy_compat_host)
+        self.image_status = QLabel("请选择结果图", self._legacy_compat_host)
+        self.artifact_info = QLabel("暂无文件信息", self._legacy_compat_host)
+        self.plot = ResidualPlot(self._legacy_compat_host)
+        self.table = QTableWidget(self._legacy_compat_host)
         self.load_button.clicked.connect(self._open)
         self.acceptance_button.clicked.connect(self.generate_acceptance)
         self.open_html_button.clicked.connect(self.open_html)
@@ -2091,6 +2591,810 @@ class ResultsPage(QWidget):
         self.acceptance_plan.setText(str(plan_path or ""))
         stored = project.extra.get("capture_artifacts") if isinstance(project.extra, dict) else None
         self.set_capture_artifacts(stored if isinstance(stored, dict) else None)
+        run_path = project.last_calibration_run
+        if run_path is None:
+            self.clear_calibration_run()
+        elif run_path.is_file():
+            self.load_calibration_run_path(run_path, silent=True)
+        else:
+            self.clear_calibration_run(
+                f"最近一次标定结果文件不存在：{run_path}",
+                path=run_path,
+            )
+
+    def clear_calibration_run(
+        self,
+        message: str = "当前项目暂无标定结果",
+        *,
+        path: str | Path | None = None,
+    ) -> None:
+        """清空 Calibration Run 展示，但保留项目和采集状态。"""
+
+        self.current_run = None
+        self.current_run_path = Path(path).expanduser().resolve() if path is not None else None
+        self.current_result = None
+        self._results_summary = None
+        self.last_html = None
+        self.open_html_button.setEnabled(False)
+        self.tree.clear()
+        self._set_artifact_records([])
+        self.run_status.setText(message)
+        self.result_tabs.setCurrentIndex(0)
+        self._update_result_overview(None)
+        self.image_preview.clear_image(message)
+        self.image_status.setText(message)
+        self.artifact_info.setText("暂无文件信息")
+
+    def load_calibration_run_path(
+        self,
+        path: str | Path,
+        *,
+        silent: bool = False,
+    ) -> CalibrationRun | None:
+        """从 Calibration Run 或旧 workflow report 路径加载统一结果。"""
+
+        source = Path(path).expanduser().resolve()
+        try:
+            run = load_calibration_run(source)
+        except Exception as exc:
+            message = f"标定结果读取失败：{source}\n{exc}"
+            self.clear_calibration_run(message, path=source)
+            if not silent:
+                QMessageBox.critical(self, "标定结果读取失败", message)
+            return None
+        self.show_calibration_run(run, path=source)
+        return run
+
+    def show_calibration_run(
+        self,
+        run: CalibrationRun,
+        *,
+        path: str | Path | None = None,
+    ) -> None:
+        """设置当前 CalibrationRun，并更新总览与结构化详细结果。"""
+
+        if not isinstance(run, CalibrationRun):
+            raise TypeError("run 必须是 CalibrationRun")
+        self.current_run = run
+        self.current_run_path = Path(path).expanduser().resolve() if path is not None else None
+        self.current_result = None
+        self._set_artifact_records([])
+        source = f"\n来源：{self.current_run_path}" if self.current_run_path is not None else ""
+        self.run_status.setText(
+            f"当前 Calibration Run：{run.run_id} · overall：{_result_status_text(run.overall_status)}{source}"
+        )
+        self.result_tabs.setCurrentIndex(0)
+        self._update_result_overview(summarize_calibration_run(run))
+
+    def _update_result_overview(self, summary: CalibrationResultsSummary | None) -> None:
+        self._results_summary = summary
+        if summary is None:
+            self.overview_run_id.setText("暂无")
+            self.overview_time.setText("暂无")
+            self.overview_status.setText("暂无")
+            self.overview_overall.setText("暂无")
+            self.overview_orientation.setText("暂无")
+            for widget in (
+                self.intrinsics_status,
+                self.intrinsics_fit_rmse,
+                self.intrinsics_test_rmse,
+                self.intrinsics_fit_images,
+                self.intrinsics_test_images,
+                self.laser_status,
+                self.laser_model,
+                self.laser_validation_rmse,
+                self.laser_validation_p95,
+                self.laser_valid_rate,
+                self.ground_status,
+                self.ground_validation_rmse,
+                self.ground_validation_p95,
+                self.laser_detail_status,
+                self.laser_detail_model,
+                self.laser_detail_validation_rmse,
+                self.laser_detail_validation_p95,
+                self.laser_detail_valid_rate,
+                self.ground_detail_status,
+                self.ground_detail_stage,
+                self.ground_detail_validation_rmse,
+                self.ground_detail_validation_p95,
+                self.ground_detail_fit_frames,
+                self.ground_detail_validation_frames,
+                self.ground_pose_status,
+                self.ground_transform_name,
+                self.ground_translation,
+                self.ground_euler_status,
+                self.ground_roll,
+                self.ground_pitch,
+                self.ground_yaw,
+                self.ground_validation_status,
+            ):
+                widget.setText("未执行")
+            self._update_intrinsics_details(None)
+            self._update_laser_surface_details(None)
+            self._update_ground_extrinsics_details(None)
+            return
+
+        self.overview_run_id.setText(summary.run_id)
+        self.overview_time.setText(_overview_time_text(summary.started_utc, summary.completed_utc))
+        self.overview_status.setText(_result_status_text(summary.status))
+        self.overview_overall.setText(_result_status_text(summary.overall))
+        self.overview_orientation.setText(summary.laser_orientation or "暂无")
+
+        self.intrinsics_status.setText(_stage_status_text(summary.intrinsics.status))
+        self.intrinsics_fit_rmse.setText(
+            _overview_metric_text(summary.intrinsics.status, summary.intrinsics.fit_rmse_px, unit=" px")
+        )
+        self.intrinsics_test_rmse.setText(
+            _overview_metric_text(summary.intrinsics.status, summary.intrinsics.test_rmse_px, unit=" px")
+        )
+        self.intrinsics_fit_images.setText(
+            _overview_metric_text(summary.intrinsics.status, summary.intrinsics.fit_image_count)
+        )
+        self.intrinsics_test_images.setText(
+            _overview_metric_text(summary.intrinsics.status, summary.intrinsics.test_image_count)
+        )
+
+        self.laser_status.setText(_stage_status_text(summary.laser_surface.status))
+        self.laser_model.setText(
+            _overview_metric_text(summary.laser_surface.status, summary.laser_surface.model_type)
+        )
+        self.laser_validation_rmse.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_rmse_mm,
+                unit=" mm",
+            )
+        )
+        self.laser_validation_p95.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_p95_mm,
+                unit=" mm",
+            )
+        )
+        self.laser_valid_rate.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_valid_rate,
+                percent=True,
+            )
+        )
+
+        self.ground_status.setText(_stage_status_text(summary.ground_extrinsics.status))
+        self.ground_validation_rmse.setText(
+            _overview_metric_text(
+                summary.ground_extrinsics.status,
+                summary.ground_extrinsics.validation_rmse_mm,
+                unit=" mm",
+            )
+        )
+        self.ground_validation_p95.setText(
+            _overview_metric_text(
+                summary.ground_extrinsics.status,
+                summary.ground_extrinsics.validation_p95_mm,
+                unit=" mm",
+            )
+        )
+
+        self.laser_detail_status.setText(_stage_status_text(summary.laser_surface.status))
+        self.laser_detail_model.setText(
+            _overview_metric_text(summary.laser_surface.status, summary.laser_surface.model_type)
+        )
+        self.laser_detail_validation_rmse.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_rmse_mm,
+                unit=" mm",
+            )
+        )
+        self.laser_detail_validation_p95.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_p95_mm,
+                unit=" mm",
+            )
+        )
+        self.laser_detail_valid_rate.setText(
+            _overview_metric_text(
+                summary.laser_surface.status,
+                summary.laser_surface.validation_valid_rate,
+                percent=True,
+            )
+        )
+
+        self.ground_detail_status.setText(_stage_status_text(summary.ground_extrinsics.status))
+        self.ground_detail_validation_rmse.setText(
+            _overview_metric_text(
+                summary.ground_extrinsics.status,
+                summary.ground_extrinsics.validation_rmse_mm,
+                unit=" mm",
+            )
+        )
+        self.ground_detail_validation_p95.setText(
+            _overview_metric_text(
+                summary.ground_extrinsics.status,
+                summary.ground_extrinsics.validation_p95_mm,
+                unit=" mm",
+            )
+        )
+        self._update_intrinsics_details(summary)
+        self._update_laser_surface_details(summary)
+        self._update_ground_extrinsics_details(summary)
+
+    @staticmethod
+    def _build_laser_plot_card(title: str, preview: QLabel) -> QWidget:
+        card = QWidget()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        caption = QLabel(title)
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(caption)
+        card_layout.addWidget(preview, 1)
+        return card
+
+    def _toggle_laser_parameters(self, expanded: bool) -> None:
+        self.laser_parameters_panel.setVisible(expanded)
+        self.laser_parameters_toggle.setText(
+            "模型参数（收起）" if expanded else "模型参数（展开）"
+        )
+
+    @staticmethod
+    def _laser_table_metric(
+        stage_status: str,
+        comparison: Any,
+        value: Any,
+        *,
+        percent: bool = False,
+    ) -> str:
+        if stage_status == NOT_EXECUTED:
+            return "未执行"
+        if comparison is None or not comparison.available:
+            return "未找到"
+        return _overview_metric_text(
+            "completed",
+            value,
+            percent=percent,
+        )
+
+    def _update_laser_comparison_table(
+        self,
+        stage_status: str,
+        details: LaserSurfaceDetails | None,
+    ) -> None:
+        comparisons = {
+            comparison.model: comparison
+            for comparison in (details.model_comparisons if details is not None else ())
+        }
+        selected_model = details.selected_model if details is not None else None
+        table = self.laser_model_comparison_table
+        table.setRowCount(len(SUPPORTED_LASER_MODEL_TYPES))
+        for row_index, model in enumerate(SUPPORTED_LASER_MODEL_TYPES):
+            comparison = comparisons.get(model)
+            values = (
+                model,
+                self._laser_table_metric(
+                    stage_status,
+                    comparison,
+                    comparison.train_rmse_mm if comparison is not None else None,
+                ),
+                self._laser_table_metric(
+                    stage_status,
+                    comparison,
+                    comparison.validation_rmse_mm if comparison is not None else None,
+                ),
+                self._laser_table_metric(
+                    stage_status,
+                    comparison,
+                    comparison.validation_p95_mm if comparison is not None else None,
+                ),
+                self._laser_table_metric(
+                    stage_status,
+                    comparison,
+                    comparison.validation_max_mm if comparison is not None else None,
+                ),
+                self._laser_table_metric(
+                    stage_status,
+                    comparison,
+                    comparison.validation_valid_rate if comparison is not None else None,
+                    percent=True,
+                ),
+                (
+                    "当前采用"
+                    if model == selected_model
+                    else "已读取"
+                    if comparison is not None and comparison.available
+                    else "未找到"
+                    if stage_status != NOT_EXECUTED
+                    else "未执行"
+                ),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if model == selected_model:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                table.setItem(row_index, column, item)
+
+    @staticmethod
+    def _laser_parameter_value(value: Any) -> str:
+        if isinstance(value, tuple):
+            return "[" + ", ".join(_detail_value(item) for item in value) + "]"
+        return _detail_value(value)
+
+    def _update_laser_parameter_table(self, details: LaserSurfaceDetails | None) -> None:
+        rows: list[tuple[str, str, str]] = []
+        if details is not None and details.status != NOT_EXECUTED:
+            for comparison in details.model_comparisons:
+                parameters = comparison.parameters
+                if parameters is None:
+                    continue
+                if comparison.model == "global_plane":
+                    for name, value in zip(
+                        ("a", "b", "c", "d"), parameters.plane_abcd
+                    ):
+                        rows.append(
+                            (
+                                comparison.model,
+                                name,
+                                self._laser_parameter_value(value),
+                            )
+                        )
+                elif comparison.model == "circular_cone":
+                    if parameters.apex_camera_mm:
+                        rows.append(
+                            (
+                                comparison.model,
+                                "apex",
+                                self._laser_parameter_value(parameters.apex_camera_mm),
+                            )
+                        )
+                    if parameters.axis_unit_camera:
+                        rows.append(
+                            (
+                                comparison.model,
+                                "axis",
+                                self._laser_parameter_value(parameters.axis_unit_camera),
+                            )
+                        )
+                    if parameters.half_apex_angle_deg is not None:
+                        rows.append(
+                            (
+                                comparison.model,
+                                "half-angle",
+                                f"{_detail_value(parameters.half_apex_angle_deg)}°",
+                            )
+                        )
+                elif comparison.model == "quadratic_graph":
+                    for index, value in enumerate(parameters.coefficients):
+                        rows.append(
+                            (
+                                comparison.model,
+                                f"coefficient β{index}",
+                                self._laser_parameter_value(value),
+                            )
+                        )
+        table = self.laser_model_parameters_table
+        table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column, value in enumerate(values):
+                table.setItem(row_index, column, QTableWidgetItem(value))
+        table.resizeRowsToContents()
+        header_height = table.horizontalHeader().sizeHint().height()
+        row_height = sum(table.rowHeight(index) for index in range(table.rowCount()))
+        table.setFixedHeight(
+            max(1, header_height + row_height + table.frameWidth() * 2 + 4)
+        )
+        table.updateGeometry()
+
+    @staticmethod
+    def _set_laser_plot_preview(
+        preview: LaserPlotPreview,
+        card: QWidget,
+        path: Path | None,
+    ) -> bool:
+        if path is None or not path.is_file():
+            preview.clear_plot()
+            card.setVisible(False)
+            return False
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            preview.clear_plot()
+            card.setVisible(False)
+            return False
+        preview.set_plot_pixmap(pixmap)
+        card.setVisible(True)
+        return True
+
+    def _update_laser_surface_details(
+        self,
+        summary: CalibrationResultsSummary | None,
+    ) -> None:
+        details = (
+            load_laser_surface_details(summary.laser_surface)
+            if summary is not None
+            else None
+        )
+        self._laser_surface_details = details
+        stage_status = summary.laser_surface.status if summary is not None else NOT_EXECUTED
+        if details is not None and details.status == NOT_EXECUTED:
+            stage_status = NOT_EXECUTED
+
+        if summary is None or details is None or stage_status == NOT_EXECUTED:
+            for widget in (
+                self.laser_detail_status,
+                self.laser_detail_model,
+                self.laser_detail_validation_rmse,
+                self.laser_detail_validation_p95,
+                self.laser_detail_valid_rate,
+            ):
+                widget.setText("未执行")
+            self.laser_model_comparison_status.setText("未执行")
+            self.laser_error_plots_status.setText("暂无已有 validation error 图")
+        else:
+            selected_model = details.selected_model or summary.laser_surface.model_type
+            self.laser_detail_status.setText(_stage_status_text(stage_status))
+            self.laser_detail_model.setText(
+                _overview_metric_text(stage_status, selected_model)
+            )
+            self.laser_detail_validation_rmse.setText(
+                _overview_metric_text(
+                    stage_status,
+                    details.validation_rmse_mm,
+                    unit=" mm",
+                )
+            )
+            self.laser_detail_validation_p95.setText(
+                _overview_metric_text(
+                    stage_status,
+                    details.validation_p95_mm,
+                    unit=" mm",
+                )
+            )
+            self.laser_detail_valid_rate.setText(
+                _overview_metric_text(
+                    stage_status,
+                    details.validation_valid_rate,
+                    percent=True,
+                )
+            )
+            available_count = sum(
+                1 for comparison in details.model_comparisons if comparison.available
+            )
+            status_parts = []
+            if details.error:
+                status_parts.append(details.error)
+            else:
+                status_parts.append(f"已读取 {available_count}/3 个模型结果")
+            status_parts.extend(details.notes)
+            self.laser_model_comparison_status.setText("；".join(status_parts))
+            plot_count = sum(
+                self._set_laser_plot_preview(preview, card, path)
+                for preview, card, path in (
+                    (
+                        self.laser_error_vs_u,
+                        self.laser_error_vs_u_card,
+                        details.error_vs_u,
+                    ),
+                    (
+                        self.laser_error_vs_v,
+                        self.laser_error_vs_v_card,
+                        details.error_vs_v,
+                    ),
+                    (
+                        self.laser_error_vs_depth,
+                        self.laser_error_vs_depth_card,
+                        details.error_vs_depth,
+                    ),
+                )
+            )
+            self.laser_error_plots_status.setText(
+                f"已展示 {plot_count} 张已有 validation error 图（未重新计算）"
+                if plot_count
+                else "未找到已有 validation error 图"
+            )
+
+        self._update_laser_comparison_table(stage_status, details)
+        self._update_laser_parameter_table(details)
+        if summary is None or details is None or stage_status == NOT_EXECUTED:
+            for preview, card in (
+                (self.laser_error_vs_u, self.laser_error_vs_u_card),
+                (self.laser_error_vs_v, self.laser_error_vs_v_card),
+                (self.laser_error_vs_depth, self.laser_error_vs_depth_card),
+            ):
+                self._set_laser_plot_preview(preview, card, None)
+
+    @staticmethod
+    def _resize_result_table(table: QTableWidget) -> None:
+        table.resizeRowsToContents()
+        header_height = table.horizontalHeader().sizeHint().height()
+        row_height = sum(table.rowHeight(index) for index in range(table.rowCount()))
+        table.setFixedHeight(
+            max(1, header_height + row_height + table.frameWidth() * 2 + 4)
+        )
+        table.updateGeometry()
+
+    def _resize_intrinsics_reprojection_table(self) -> None:
+        """按逐图结果数量收紧内参表格，避免空状态占满整页。"""
+
+        table = self.intrinsics_reprojection_table
+        table.resizeRowsToContents()
+        header_height = table.horizontalHeader().sizeHint().height()
+        row_height = sum(table.rowHeight(index) for index in range(table.rowCount()))
+        content_height = header_height + row_height + table.frameWidth() * 2 + 4
+        # 逐图结果较多时保留表格自身的按需滚动，避免把内参页撑出窗口。
+        table.setFixedHeight(max(36, min(content_height, 420)))
+        table.updateGeometry()
+
+    def _update_ground_validation_table(self, rows: tuple[Any, ...]) -> None:
+        table = self.ground_validation_table
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                row.frame,
+                _result_status_text(row.status or "recorded"),
+                _detail_value(row.pnp_rmse_px),
+                _detail_value(row.rmse_mm),
+                _detail_value(row.p95_mm),
+                _detail_value(row.max_mm),
+                _detail_value(row.std_mm),
+                _detail_value(row.point_count),
+            )
+            for column, value in enumerate(values):
+                table.setItem(row_index, column, QTableWidgetItem(value))
+        self._resize_result_table(table)
+
+    def _update_ground_extrinsics_details(
+        self,
+        summary: CalibrationResultsSummary | None,
+    ) -> None:
+        details = (
+            load_ground_extrinsics_details(summary.ground_extrinsics)
+            if summary is not None
+            else None
+        )
+        self._ground_extrinsics_details = details
+        stage_status = (
+            summary.ground_extrinsics.status if summary is not None else NOT_EXECUTED
+        )
+        if details is not None and details.status == NOT_EXECUTED:
+            stage_status = NOT_EXECUTED
+
+        if summary is None or details is None or stage_status == NOT_EXECUTED:
+            for widget in (
+                self.ground_detail_status,
+                self.ground_detail_stage,
+                self.ground_detail_validation_rmse,
+                self.ground_detail_validation_p95,
+                self.ground_detail_fit_frames,
+                self.ground_detail_validation_frames,
+                self.ground_pose_status,
+                self.ground_transform_name,
+                self.ground_translation,
+                self.ground_euler_status,
+                self.ground_roll,
+                self.ground_pitch,
+                self.ground_yaw,
+                self.ground_validation_status,
+            ):
+                widget.setText("未执行")
+            self._set_ground_rotation((), "未执行")
+            self._update_ground_validation_table(())
+            self._set_laser_plot_preview(
+                self.ground_validation_error_plot,
+                self.ground_validation_error_plot_card,
+                None,
+            )
+            return
+
+        validation_rmse = summary.ground_extrinsics.validation_rmse_mm
+        if validation_rmse is None:
+            validation_rmse = details.validation_rmse_mm
+        validation_p95 = summary.ground_extrinsics.validation_p95_mm
+        if validation_p95 is None:
+            validation_p95 = details.validation_p95_mm
+        self.ground_status.setText(_stage_status_text(stage_status))
+        self.ground_validation_rmse.setText(
+            _overview_metric_text(stage_status, validation_rmse, unit=" mm")
+        )
+        self.ground_validation_p95.setText(
+            _overview_metric_text(stage_status, validation_p95, unit=" mm")
+        )
+        self.ground_detail_status.setText(_stage_status_text(stage_status))
+        self.ground_detail_stage.setText(details.stage)
+        self.ground_detail_validation_rmse.setText(
+            _overview_metric_text(stage_status, validation_rmse, unit=" mm")
+        )
+        self.ground_detail_validation_p95.setText(
+            _overview_metric_text(stage_status, validation_p95, unit=" mm")
+        )
+        self.ground_detail_fit_frames.setText(
+            _overview_metric_text(stage_status, details.fit_frame_count)
+        )
+        self.ground_detail_validation_frames.setText(
+            _overview_metric_text(stage_status, details.validation_frame_count)
+        )
+
+        self.ground_transform_name.setText(details.transform_name or "暂无")
+        self._set_ground_rotation(details.rotation_matrix, "暂无")
+        if len(details.translation_mm) >= 3:
+            translation = "[" + ", ".join(
+                _detail_value(value) for value in details.translation_mm[:3]
+            ) + "] mm"
+        else:
+            translation = "暂无"
+        self.ground_translation.setText(translation)
+        if (
+            details.roll_deg is not None
+            and details.pitch_deg is not None
+            and details.yaw_deg is not None
+        ):
+            self.ground_euler_status.setText("结果文件已提供（单位 °）")
+            self.ground_roll.setText(f"{details.roll_deg:.6f}°")
+            self.ground_pitch.setText(f"{details.pitch_deg:.6f}°")
+            self.ground_yaw.setText(f"{details.yaw_deg:.6f}°")
+        else:
+            self.ground_euler_status.setText(
+                "暂无（项目未定义可靠的 Euler 轴顺序，未自行换算）"
+            )
+            self.ground_roll.setText("暂无")
+            self.ground_pitch.setText("暂无")
+            self.ground_yaw.setText("暂无")
+
+        pose_messages: list[str] = []
+        if details.error:
+            pose_messages.append(details.error)
+        if details.rotation_matrix:
+            pose_messages.append("已读取 T_ground_from_camera 的 R/t")
+        else:
+            pose_messages.append("结果文件未提供有效的 camera → ground R/t")
+        self.ground_pose_status.setText("；".join(pose_messages))
+
+        validation_messages: list[str] = []
+        if details.error:
+            validation_messages.append(details.error)
+        if details.validation_rows:
+            validation_messages.append(
+                f"已读取 {len(details.validation_rows)} 条逐帧 validation 结果（未重新计算）"
+            )
+        else:
+            validation_messages.append("未找到已有独立 validation 逐帧结果")
+        self.ground_validation_status.setText("；".join(validation_messages))
+        self._update_ground_validation_table(details.validation_rows)
+        self._set_laser_plot_preview(
+            self.ground_validation_error_plot,
+            self.ground_validation_error_plot_card,
+            details.validation_error_plot,
+        )
+
+    def _set_ground_rotation(
+        self,
+        matrix: tuple[tuple[float, ...], ...],
+        placeholder: str,
+    ) -> None:
+        table = self.ground_rotation_table
+        table.setRowCount(3)
+        table.setColumnCount(3)
+        for row in range(3):
+            for column in range(3):
+                value = _matrix_value(matrix, row, column)
+                text = _detail_value(value) if value is not None else placeholder
+                table.setItem(row, column, QTableWidgetItem(text))
+        self._resize_result_table(table)
+
+    def _update_intrinsics_details(
+        self,
+        summary: CalibrationResultsSummary | None,
+    ) -> None:
+        details: IntrinsicsDetails | None = (
+            load_intrinsics_details(summary.intrinsics) if summary is not None else None
+        )
+
+        stage_status = summary.intrinsics.status if summary is not None else NOT_EXECUTED
+        fit_rmse = summary.intrinsics.fit_rmse_px if summary is not None else None
+        test_rmse = summary.intrinsics.test_rmse_px if summary is not None else None
+        fit_images = summary.intrinsics.fit_image_count if summary is not None else None
+        test_images = summary.intrinsics.test_image_count if summary is not None else None
+        if details is not None:
+            fit_rmse = fit_rmse if fit_rmse is not None else details.fit_rmse_px
+            test_rmse = test_rmse if test_rmse is not None else details.test_rmse_px
+            fit_images = fit_images if fit_images is not None else details.fit_image_count
+            test_images = test_images if test_images is not None else details.test_image_count
+        self.intrinsics_detail_fit_rmse.setText(
+            _overview_metric_text(
+                stage_status,
+                fit_rmse,
+                unit=" px",
+            )
+        )
+        self.intrinsics_detail_test_rmse.setText(
+            _overview_metric_text(
+                stage_status,
+                test_rmse,
+                unit=" px",
+            )
+        )
+        self.intrinsics_detail_fit_images.setText(
+            _overview_metric_text(
+                stage_status,
+                fit_images,
+            )
+        )
+        self.intrinsics_detail_test_images.setText(
+            _overview_metric_text(
+                stage_status,
+                test_images,
+            )
+        )
+
+        if details is None or details.status == NOT_EXECUTED:
+            self.intrinsics_detail_status.setText("未执行")
+            self.intrinsics_reprojection_status.setText("未执行")
+            self.intrinsics_reprojection_table.setRowCount(0)
+            self._resize_intrinsics_reprojection_table()
+            for widget in (
+                self.intrinsics_fx,
+                self.intrinsics_fy,
+                self.intrinsics_cx,
+                self.intrinsics_cy,
+                self.intrinsics_k1,
+                self.intrinsics_k2,
+                self.intrinsics_p1,
+                self.intrinsics_p2,
+                self.intrinsics_k3,
+            ):
+                widget.setText("未执行")
+            return
+
+        if details.error:
+            self.intrinsics_detail_status.setText(details.error)
+        else:
+            message = "内参结果已加载"
+            if details.notes:
+                message += "；" + "；".join(details.notes)
+            self.intrinsics_detail_status.setText(message)
+
+        matrix = details.camera_matrix
+        self.intrinsics_fx.setText(_detail_value(_matrix_value(matrix, 0, 0)))
+        self.intrinsics_fy.setText(_detail_value(_matrix_value(matrix, 1, 1)))
+        self.intrinsics_cx.setText(_detail_value(_matrix_value(matrix, 0, 2)))
+        self.intrinsics_cy.setText(_detail_value(_matrix_value(matrix, 1, 2)))
+        distortion = details.dist_coeffs
+        for widget, index in (
+            (self.intrinsics_k1, 0),
+            (self.intrinsics_k2, 1),
+            (self.intrinsics_p1, 2),
+            (self.intrinsics_p2, 3),
+            (self.intrinsics_k3, 4),
+        ):
+            widget.setText(_detail_value(distortion[index] if index < len(distortion) else None))
+
+        rows = details.reprojection_rows
+        self.intrinsics_reprojection_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (
+                row.split,
+                row.image,
+                _result_status_text(row.status),
+                _detail_value(row.rmse_px),
+                _detail_value(row.mean_error_px),
+            )
+            for column, value in enumerate(values):
+                self.intrinsics_reprojection_table.setItem(
+                    row_index,
+                    column,
+                    QTableWidgetItem(value),
+                )
+        self._resize_intrinsics_reprojection_table()
+        if rows:
+            self.intrinsics_reprojection_status.setText(
+                f"已读取 {len(rows)} 条逐图重投影误差（未重新计算）"
+            )
+        elif details.error:
+            self.intrinsics_reprojection_status.setText(details.error)
+        else:
+            self.intrinsics_reprojection_status.setText("未找到已有逐图重投影误差")
 
     def prepare_default_plan(self, *, announce: bool = True) -> Path | None:
         """进入第 5 页时创建默认计划；已有显式计划保持不动。"""
@@ -2187,6 +3491,8 @@ class ResultsPage(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_html.resolve())))
 
     def show_result(self, result: dict[str, Any]) -> None:
+        """展示通用报告投影；标定主结果入口是 ``show_calibration_run``。"""
+
         self.current_result = dict(result)
         self.tree.clear()
         _add_tree(self.tree.invisibleRootItem(), self.current_result)
@@ -2365,16 +3671,46 @@ class ResultsPage(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent.resolve())))
 
     def _open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "打开标定报告", "", "YAML/JSON (*.yaml *.yml *.json)")
+        start = ""
+        if self.current_run_path is not None:
+            start = str(self.current_run_path)
+        elif self.project is not None and self.project.last_calibration_run is not None:
+            start = str(self.project.last_calibration_run)
+        elif self.project is not None:
+            start = str(self.project.workspace)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "打开历史标定结果",
+            start,
+            "Calibration Run / Workflow (*.yaml *.yml);;JSON (*.json);;All files (*)",
+        )
         if not path:
             return
-        try:
-            self.show_result(load_document(path))
-            html_path = Path(path).with_suffix(".html")
-            self.last_html = html_path if html_path.is_file() else None
-            self.open_html_button.setEnabled(self.last_html is not None)
-        except Exception as exc:
-            QMessageBox.critical(self, "报告读取失败", str(exc))
+        source = Path(path).expanduser().resolve()
+        run = self.load_calibration_run_path(source, silent=True)
+        if run is None:
+            # 验收报告仍可作为通用报告打开；Calibration Run/旧 workflow 文件
+            # 加载失败时不回退到原始 dict，避免绕过统一结果入口。
+            is_calibration_path = (
+                source.stem.lower() == Path(DEFAULT_CALIBRATION_RUN_FILENAME).stem.lower()
+                or source.stem.lower().startswith("workflow_")
+            )
+            if is_calibration_path:
+                QMessageBox.critical(self, "历史标定结果读取失败", self.run_status.text())
+                return
+            try:
+                report = load_document(source)
+            except Exception as exc:
+                QMessageBox.critical(self, "报告读取失败", str(exc))
+                return
+            self.current_run = None
+            self.current_run_path = None
+            self._update_result_overview(None)
+            self.show_result(report)
+            self.run_status.setText("当前显示历史验收报告；尚未加载 Calibration Run")
+        html_path = Path(path).with_suffix(".html")
+        self.last_html = html_path if html_path.is_file() else None
+        self.open_html_button.setEnabled(self.last_html is not None)
 
     def _artifact_selected(self) -> None:
         items = self.artifacts.selectedItems()
@@ -2410,6 +3746,98 @@ def load_residual_csv(path: Path, limit: int = 500) -> tuple[list[str], list[lis
         if len(values) >= 2:
             return headers, rows, values
     return headers, rows, []
+
+
+_RESULT_STATUS_LABELS = {
+    "completed": "已完成",
+    "complete": "已完成",
+    "pass": "通过",
+    "passed": "通过",
+    "warn": "警告",
+    "warning": "警告",
+    "fail": "失败",
+    "failed": "失败",
+    "error": "错误",
+    "unknown": "未知",
+    "not_executed": "未执行",
+    "skipped": "已跳过",
+    "unavailable": "不可用",
+    "loaded": "已加载",
+    "used": "已使用",
+    "evaluated": "已评估",
+    "recorded": "已记录",
+    "valid": "有效",
+    "invalid": "无效",
+}
+
+
+def _result_status_text(status: Any) -> str:
+    if status is None:
+        return "暂无"
+    value = str(status).strip()
+    if not value:
+        return "暂无"
+    return _RESULT_STATUS_LABELS.get(value.lower(), value)
+
+
+def _stage_status_text(status: str) -> str:
+    return _result_status_text(status)
+
+
+def _overview_metric_text(
+    status: str,
+    value: Any,
+    *,
+    unit: str = "",
+    percent: bool = False,
+) -> str:
+    if status == NOT_EXECUTED:
+        return "未执行"
+    if value is None:
+        return "暂无"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(float(value)):
+        return "暂无"
+    if percent and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{float(value):.1%}"
+    if isinstance(value, float):
+        return f"{value:.4f}{unit}"
+    return f"{value}{unit}"
+
+
+def _overview_time_text(
+    started_utc: datetime | None,
+    completed_utc: datetime | None,
+) -> str:
+    def format_time(value: datetime | None) -> str | None:
+        return value.isoformat(timespec="seconds") if value is not None else None
+
+    started = format_time(started_utc)
+    completed = format_time(completed_utc)
+    if started and completed:
+        return f"{started} ~ {completed}"
+    return started or completed or "暂无"
+
+
+def _matrix_value(
+    matrix: tuple[tuple[float, ...], ...],
+    row: int,
+    column: int,
+) -> float | None:
+    if row >= len(matrix) or column >= len(matrix[row]):
+        return None
+    return matrix[row][column]
+
+
+def _detail_value(value: Any) -> str:
+    if value is None:
+        return "暂无"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(float(value)):
+            return "暂无"
+        return f"{float(value):.6f}"
+    return str(value)
 
 
 def _add_tree(parent: QTreeWidgetItem, value: Any, name: str = "root") -> None:

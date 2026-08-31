@@ -17,12 +17,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..calibration_run import CalibrationRun
+from ..calibration_run_io import (
+    DEFAULT_CALIBRATION_RUN_FILENAME,
+    infer_calibration_run_root,
+    save_calibration_run,
+)
 from .pages import CalibrationPage, CameraPage, CapturePage, ProjectPage, ResultsPage
 from .project import WizardProject
 
 
 class CalibrationWizardWindow(QMainWindow):
-    STEP_NAMES = ("项目", "相机与曝光", "批量采集", "一键标定", "报告、补偿与验收")
+    STEP_NAMES = ("项目", "相机与曝光", "批量采集", "一键标定", "标定结果")
 
     def __init__(
         self,
@@ -119,10 +125,65 @@ class CalibrationWizardWindow(QMainWindow):
         self.project_page.apply()
 
     def _workflow_finished(self, result: dict) -> None:
-        self.results_page.update_acceptance_from_workflow(result)
-        self.results_page.show_result(result)
+        manifest_path, persist_error = self._persist_calibration_run(result)
+        run = None
+        if manifest_path is not None:
+            run = self.results_page.load_calibration_run_path(manifest_path, silent=True)
+            if run is not None:
+                # 验收计划仍可使用同一份标准化投影；第 5 页不再直接消费原始
+                # workflow result 作为标定主结果。
+                self.results_page.update_acceptance_from_workflow(run.to_report())
+        elif result.get("status") == "completed":
+            message = (
+                "本次 workflow 未生成 Calibration Run（无法可靠推断共同 run 根目录）"
+                if persist_error is None
+                else f"本次 workflow 未加载 Calibration Run：{persist_error}"
+            )
+            self.results_page.clear_calibration_run(message)
         self.steps.setCurrentRow(4)
-        self.statusBar().showMessage(f"标定 workflow：{result.get('status')}", 15000)
+        if manifest_path is not None:
+            if run is None:
+                message = f"标定 workflow：{result.get('status')}；Calibration Run 已生成，但第 5 页读取失败"
+            else:
+                project_note = (
+                    "；项目路径已更新"
+                    if self.project is not None and self.project.source_path is not None
+                    else "；项目尚未保存，仅保留当前会话"
+                )
+                message = f"标定 workflow：{result.get('status')}；Calibration Run：{manifest_path}{project_note}"
+        elif persist_error:
+            message = f"标定 workflow：{result.get('status')}；Calibration Run 保存失败：{persist_error}"
+        elif result.get("status") == "completed" and self.project is not None:
+            message = "标定 workflow：completed；未生成 Calibration Run（无法可靠推断共同 run 根目录）"
+        else:
+            message = f"标定 workflow：{result.get('status')}"
+        self.statusBar().showMessage(message, 15000)
+
+    def _persist_calibration_run(self, result: dict) -> tuple[Path | None, str | None]:
+        """在成功 workflow 完成后写入 manifest，并记录到当前项目。"""
+
+        if self.project is None or result.get("status") != "completed":
+            return None, None
+        try:
+            run_root = infer_calibration_run_root(result)
+            if run_root is None:
+                return None, None
+            run_id = run_root.name
+            if not run_id:
+                return None, "共同 run 根目录没有有效目录名"
+            run = CalibrationRun.from_report(
+                result,
+                run_id=run_id,
+                project_id=self.project.project_id,
+            )
+            manifest_path = save_calibration_run(
+                run,
+                run_root / DEFAULT_CALIBRATION_RUN_FILENAME,
+            )
+            self.project.record_calibration_run(manifest_path)
+            return manifest_path, None
+        except Exception as exc:
+            return None, str(exc)
 
     def _capture_finished(self, result: object) -> None:
         artifacts = getattr(result, "capture_artifacts", None) or self.capture_page.last_capture_artifacts

@@ -15,7 +15,9 @@ class WizardProjectTests(unittest.TestCase):
                 "schema_version: 1\nproject_id: old\nworkspace: .\ncamera_config: camera.yaml\n",
                 encoding="utf-8",
             )
-            self.assertEqual(WizardProject.load(root / "project.yaml").laser.orientation, "horizontal")
+            loaded = WizardProject.load(root / "project.yaml")
+            self.assertEqual(loaded.laser.orientation, "horizontal")
+            self.assertIsNone(loaded.last_calibration_run)
 
     def test_missing_project_laser_inherits_daheng_camera_orientation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -82,6 +84,22 @@ class WizardProjectTests(unittest.TestCase):
             self.assertTrue(backup.is_file())
             loaded = WizardProject.load(path)
             self.assertEqual(loaded.extra["capture_artifacts"]["dataset_root"], str(root / "dataset"))
+
+    def test_calibration_run_path_is_persisted_and_reloaded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            camera = root / "camera.yaml"
+            camera.write_text("backend: synthetic\n", encoding="utf-8")
+            project = WizardProject("test", root / "work", camera)
+            path = project.save(root / "project.yaml")
+            run_path = root / "runs" / "20260828" / "calibration_run.yaml"
+
+            backup = project.record_calibration_run(run_path)
+
+            self.assertEqual(project.last_calibration_run, run_path.resolve())
+            self.assertEqual(backup, path.with_name("project.yaml.bak"))
+            self.assertTrue(backup.is_file())
+            self.assertEqual(WizardProject.load(path).last_calibration_run, run_path.resolve())
 
 
 if __name__ == "__main__":

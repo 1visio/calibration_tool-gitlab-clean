@@ -27,6 +27,7 @@ class WizardProject:
     source_path: Path | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     laser: LaserConfig = field(default_factory=LaserConfig)
+    last_calibration_run: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.project_id.strip():
@@ -43,6 +44,8 @@ class WizardProject:
             self.acceptance_plan = self.acceptance_plan.expanduser().resolve()
         if self.capture_output is not None:
             self.capture_output = self.capture_output.expanduser().resolve()
+        if self.last_calibration_run is not None:
+            self.last_calibration_run = self.last_calibration_run.expanduser().resolve()
 
     @classmethod
     def load(cls, path: str | Path) -> "WizardProject":
@@ -62,6 +65,7 @@ class WizardProject:
         workflow_value = document.get("workflow_plan") or camera_runtime.get("workflow_plan")
         acceptance_value = document.get("acceptance_plan")
         capture_value = document.get("capture_output")
+        last_calibration_run_value = document.get("last_calibration_run")
         laser = (
             parse_laser_config(document["laser"], field_name="wizard project.laser")
             if "laser" in document
@@ -76,6 +80,11 @@ class WizardProject:
             workflow_plan=resolve_relative(source, workflow_value) if workflow_value else None,
             acceptance_plan=resolve_relative(source, acceptance_value) if acceptance_value else None,
             capture_output=resolve_relative(source, capture_value) if capture_value else None,
+            last_calibration_run=(
+                resolve_relative(source, last_calibration_run_value)
+                if last_calibration_run_value
+                else None
+            ),
             pattern_cols=int(board.get("pattern_cols", 11)),
             pattern_rows=int(board.get("pattern_rows", 8)),
             square_size_mm=float(board.get("square_size_mm", 20.0)),
@@ -105,6 +114,7 @@ class WizardProject:
             "workflow_plan": relative_or_absolute(self.workflow_plan),
             "acceptance_plan": relative_or_absolute(self.acceptance_plan),
             "capture_output": relative_or_absolute(self.capture_output),
+            "last_calibration_run": relative_or_absolute(self.last_calibration_run),
             "board": {
                 "pattern_cols": self.pattern_cols,
                 "pattern_rows": self.pattern_rows,
@@ -122,6 +132,19 @@ class WizardProject:
         self.extra = dict(self.extra)
         self.extra["capture_artifacts"] = dict(artifacts)
         if not persist or self.source_path is None:
+            return None
+        return self._save_with_backup()
+
+    def record_calibration_run(self, path: str | Path, *, persist: bool = True) -> Path | None:
+        """记录最近一次 Calibration Run 路径，并按项目文件需要持久化。"""
+
+        self.last_calibration_run = Path(path).expanduser().resolve()
+        if not persist or self.source_path is None:
+            return None
+        return self._save_with_backup()
+
+    def _save_with_backup(self) -> Path | None:
+        if self.source_path is None:
             return None
         source = self.source_path.resolve()
         backup = source.with_name(f"{source.name}.bak")
